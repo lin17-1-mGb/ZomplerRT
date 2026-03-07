@@ -995,7 +995,7 @@ class UPS_C:
         v = self.get_voltage()
         if v == 0.0: return "N/A"
         p = self.get_capacity_percent()
-        total_minutes = (p / 100) * (160 if LOW_POWER_MODE else 130)
+        total_minutes = (p / 100) * (210 if LOW_POWER_MODE else 180)
         return f"{int(total_minutes // 60)}h{int(total_minutes % 60):02d}m"
 
 ups = UPS_C()
@@ -1224,21 +1224,27 @@ def toggle_power_mode():
     global LOW_POWER_MODE, MESSAGE, msg_start_time
     LOW_POWER_MODE = not LOW_POWER_MODE
     if LOW_POWER_MODE:
-        os.system("sudo tvservice -o > /dev/null 2>&1")
-        os.system("sudo rfkill block wifi")
-        os.system("echo powersave | sudo tee /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /dev/null")
-        os.system(f"echo none | sudo tee /sys/class/leds/{LED_NAME}/trigger > /dev/null")
-        os.system(f"echo 0 | sudo tee /sys/class/leds/{LED_NAME}/brightness > /dev/null")
-        if fs: fs.setting('synth.polyphony', 48)
-        MESSAGE = "Lean: ON (ECO)"
+        # Block WiFi - genuine power saving on Zero 2W
+        os.system("sudo rfkill block wifi > /dev/null 2>&1")
+        os.system("sudo rfkill block bluetooth > /dev/null 2>&1")
+        # Dim the activity LED
+        os.system(f"echo none | sudo tee /sys/class/leds/{LED_NAME}/trigger > /dev/null 2>&1")
+        os.system(f"echo 0 | sudo tee /sys/class/leds/{LED_NAME}/brightness > /dev/null 2>&1")
+        # Lower polyphony only if SYNTH menu hasn't set it higher than 64
+        if fs and SYNTH_POLYPHONY_OPTS[synth_polyphony_idx] > 48:
+            fs.setting('synth.polyphony', 48)
+        MESSAGE = "Low Power: ON"
     else:
-        os.system("sudo tvservice -p > /dev/null 2>&1")
-        os.system("sudo rfkill unblock wifi")
-        os.system("echo ondemand | sudo tee /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /dev/null")
-        os.system(f"echo mmc0 | sudo tee /sys/class/leds/{LED_NAME}/trigger > /dev/null")
-        os.system(f"echo 1 | sudo tee /sys/class/leds/{LED_NAME}/brightness > /dev/null")
-        if fs: fs.setting('synth.polyphony', 96)
-        MESSAGE = "Lean: OFF (MAX)"
+        # Restore WiFi/BT
+        os.system("sudo rfkill unblock wifi > /dev/null 2>&1")
+        os.system("sudo rfkill unblock bluetooth > /dev/null 2>&1")
+        # Restore LED
+        os.system(f"echo mmc0 | sudo tee /sys/class/leds/{LED_NAME}/trigger > /dev/null 2>&1")
+        os.system(f"echo 1 | sudo tee /sys/class/leds/{LED_NAME}/brightness > /dev/null 2>&1")
+        # Restore polyphony from SYNTH menu setting
+        if fs:
+            fs.setting('synth.polyphony', SYNTH_POLYPHONY_OPTS[synth_polyphony_idx])
+        MESSAGE = "Low Power: OFF"
     msg_start_time = time.time()
 
 # --- 11. MIDI ENGINE & PRESETS ---
