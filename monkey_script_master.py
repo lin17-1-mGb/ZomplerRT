@@ -995,7 +995,7 @@ class UPS_C:
         v = self.get_voltage()
         if v == 0.0: return "N/A"
         p = self.get_capacity_percent()
-        total_minutes = (p / 100) * (210 if LOW_POWER_MODE else 180)
+        total_minutes = (p / 100) * (190 if LOW_POWER_MODE else 160)
         return f"{int(total_minutes // 60)}h{int(total_minutes % 60):02d}m"
 
 ups = UPS_C()
