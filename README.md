@@ -11,7 +11,7 @@ Hardware and software setup for the Zompler RT on a Raspberry Pi Zero 2W with Pi
 - 3.7V 1000mAh Li-ion battery
 - MicroSD card (16GB+ recommended if using large soundfonts)
 - USB-A to Micro-USB OTG adapter (for MIDI keyboard)
-
+- Works well with bluetooth midi controllers such as Wavy Industries Monkey, CME WIDI
 ---
 
 ## 1. Flash Raspberry Pi OS
