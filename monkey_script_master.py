@@ -1224,9 +1224,8 @@ def toggle_power_mode():
     global LOW_POWER_MODE, MESSAGE, msg_start_time
     LOW_POWER_MODE = not LOW_POWER_MODE
     if LOW_POWER_MODE:
-        # Block WiFi - genuine power saving on Zero 2W
+        # Block WiFi only - keep BT for Monkey BPM connection
         os.system("sudo rfkill block wifi > /dev/null 2>&1")
-        os.system("sudo rfkill block bluetooth > /dev/null 2>&1")
         # Dim the activity LED
         os.system(f"echo none | sudo tee /sys/class/leds/{LED_NAME}/trigger > /dev/null 2>&1")
         os.system(f"echo 0 | sudo tee /sys/class/leds/{LED_NAME}/brightness > /dev/null 2>&1")
@@ -1235,9 +1234,8 @@ def toggle_power_mode():
             fs.setting('synth.polyphony', 48)
         MESSAGE = "Low Power: ON"
     else:
-        # Restore WiFi/BT
+        # Restore WiFi
         os.system("sudo rfkill unblock wifi > /dev/null 2>&1")
-        os.system("sudo rfkill unblock bluetooth > /dev/null 2>&1")
         # Restore LED
         os.system(f"echo mmc0 | sudo tee /sys/class/leds/{LED_NAME}/trigger > /dev/null 2>&1")
         os.system(f"echo 1 | sudo tee /sys/class/leds/{LED_NAME}/brightness > /dev/null 2>&1")
