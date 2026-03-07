@@ -153,6 +153,11 @@ class MidiRecorder:
     def stop(self, filename):
         if not self.recording: return
         self.recording = False
+        if fs:
+            try:
+                for ch in range(16):
+                    fs.cc(ch, 123, 0)  # All notes off
+            except: pass
         self.mid.save(filename)
 
     def add_event(self, msg):
@@ -175,6 +180,21 @@ metro_adjusting = False
 # ---------------------- LOOP RECORDING ----------------------
 loop_length = 4  # Number of bars in loop (4, 8, 16, 32)
 loop_recording = False  # True when recording a loop
+
+# ---------------------- SYNTH SETTINGS ----------------------
+SYNTH_PARAMS = ["POLYPHONY", "REVERB", "CHORUS", "BUFFER", "INTERPOLATION"]
+synth_selected  = 0
+synth_adjusting = False
+synth_polyphony_idx = 1   # 64
+synth_reverb_idx    = 0   # Off
+synth_chorus_idx    = 0   # Off
+synth_buffer_idx    = 1   # 128
+synth_interp_idx    = 1   # Sinc
+SYNTH_POLYPHONY_OPTS = [32, 64, 96, 128, 256]
+SYNTH_REVERB_OPTS    = ["Off", "Small", "Medium", "Large"]
+SYNTH_CHORUS_OPTS    = ["Off", "Light", "Heavy"]
+SYNTH_BUFFER_OPTS    = [64, 128, 256]
+SYNTH_INTERP_OPTS    = ["Linear", "Sinc"]
 loop_playback = False  # True when loop is playing back
 loop_file_path = None  # Path to temporary loop file
 loop_start_time = 0  # When loop recording started
@@ -911,13 +931,21 @@ def metronome_worker():
         
         if metronome_on and fs:
             try:
-                fs.noteon(9, 76, 110) 
+                beat_interval = 60.0 / current_bpm
+                if not hasattr(metronome_worker, '_next_beat'):
+                    metronome_worker._next_beat = time.time()
+                now = time.time()
+                if now < metronome_worker._next_beat:
+                    time.sleep(metronome_worker._next_beat - now)
+                fs.noteon(9, 76, 110)
                 time.sleep(0.05)
                 fs.noteoff(9, 76)
-                time.sleep((60.0 / current_bpm) - 0.05)
-            except: 
+                metronome_worker._next_beat += beat_interval
+            except:
+                metronome_worker._next_beat = time.time()
                 time.sleep(0.1)
         else:
+            metronome_worker._next_beat = time.time()
             time.sleep(0.2)
 
 threading.Thread(target=metronome_worker, daemon=True).start()
@@ -973,7 +1001,7 @@ class UPS_C:
 ups = UPS_C()
 
 # --- 8. UI STATE ---
-MAIN_MENU = ["MIDI KEYBOARD", "SOUND FONT", "MIDI FILE", "MIXER", "DRUM KIT", "RECORD", "STOP LOOP", "UNDO OVERDUB", "LOOP LENGTH", "METRONOME", "VOLUME", "POWER", "SHUTDOWN"]
+MAIN_MENU = ["MIDI KEYBOARD", "SOUND FONT", "MIDI FILE", "MIXER", "DRUM KIT", "RECORD", "STOP LOOP", "UNDO OVERDUB", "DOUBLE LOOP", "LOOP LENGTH", "METRONOME", "VOLUME", "SYNTH", "POWER", "SHUTDOWN"]
 files = MAIN_MENU.copy()
 pathes = MAIN_MENU.copy()
 selectedindex = 0
@@ -1088,6 +1116,7 @@ def init_fluidsynth_lazy():
             # START
             # ==============================
             fs.start(driver="alsa", device="hw:0,0")
+            apply_synth_settings()
 
             print("[AUDIO] FluidSynth low-latency mode active")
 
@@ -1125,6 +1154,71 @@ def undo_last_overdub():
     MESSAGE = f"Undone! ({len(loop_undo_stack)} left)"
     msg_start_time = time.time()
     print(f"[UNDO] Restored previous state ({len(loop_undo_stack)} undo levels remaining)")
+
+def apply_synth_settings():
+    """Apply current synth_* index values to FluidSynth"""
+    if not fs: return
+    try:
+        # Polyphony
+        fs.setting('synth.polyphony', SYNTH_POLYPHONY_OPTS[synth_polyphony_idx])
+
+        # Reverb
+        rv = synth_reverb_idx
+        if rv == 0:
+            fs.setting('synth.reverb.active', 0)
+        else:
+            fs.setting('synth.reverb.active', 1)
+            room  = [0.0, 0.2, 0.5, 0.8][rv]
+            damp  = [0.0, 0.3, 0.5, 0.7][rv]
+            width = [0.0, 0.5, 1.0, 1.0][rv]
+            level = [0.0, 0.6, 0.8, 0.9][rv]
+            fs.set_reverb(room, damp, width, level)
+
+        # Chorus
+        ch = synth_chorus_idx
+        if ch == 0:
+            fs.setting('synth.chorus.active', 0)
+        else:
+            fs.setting('synth.chorus.active', 1)
+            nr    = [0, 2, 5][ch]
+            level = [0.0, 0.5, 0.9][ch]
+            speed = [0.3, 0.3, 0.5][ch]
+            depth = [8.0, 8.0, 12.0][ch]
+            fs.set_chorus(nr, level, speed, depth, 0)
+
+        # Interpolation — 1=linear, 4=sinc 7th order
+        interp = 1 if synth_interp_idx == 0 else 4
+        fs.setting('synth.interpolation', interp)
+
+        print(f"[SYNTH] Applied: poly={SYNTH_POLYPHONY_OPTS[synth_polyphony_idx]} "
+              f"reverb={SYNTH_REVERB_OPTS[synth_reverb_idx]} "
+              f"chorus={SYNTH_CHORUS_OPTS[synth_chorus_idx]} "
+              f"interp={SYNTH_INTERP_OPTS[synth_interp_idx]}")
+    except Exception as e:
+        print(f"[SYNTH] apply error: {e}")
+
+def double_loop():
+    global loop_midi_events, loop_length, loop_undo_stack, MESSAGE, msg_start_time
+    global playback_mode, loop_start_time
+    if not loop_midi_events:
+        MESSAGE = "No loop to double"; msg_start_time = time.time(); return
+    if loop_length >= 32:
+        MESSAGE = "Max 32 bars"; msg_start_time = time.time(); return
+    current_bpm = MONKEY_BPM if BLE_CONNECTED else bpm
+    current_loop_seconds = (60.0 / current_bpm) * 4 * loop_length
+    import copy
+    loop_undo_stack.append(copy.deepcopy(loop_midi_events))
+    if len(loop_undo_stack) > MAX_UNDO_LEVELS: loop_undo_stack.pop(0)
+    doubled = [{**e, 'time': e['time'] + current_loop_seconds} for e in loop_midi_events]
+    loop_midi_events = sorted(loop_midi_events + doubled, key=lambda x: x['time'])
+    loop_length = min(32, loop_length * 2)
+    with playback_lock:
+        if playback_mode == PLAYBACK_LIVE_LOOP:
+            playback_mode = PLAYBACK_NONE
+            loop_start_time = time.time()
+            playback_mode = PLAYBACK_LIVE_LOOP
+    MESSAGE = f"Doubled! {loop_length} bars"; msg_start_time = time.time()
+    print(f"[LOOP] Doubled to {loop_length} bars")
 
 def toggle_power_mode():
     global LOW_POWER_MODE, MESSAGE, msg_start_time
@@ -1276,7 +1370,7 @@ class MultiMidiIn:
                     
                     # Store in active ports
                     self.active_ports[name] = midiin
-                    
+                    self.watch_port(name)
                     MESSAGE = f"Conn: {name[:16]}"
                     msg_start_time = time.time()
             except Exception as e:
@@ -1315,6 +1409,28 @@ class MultiMidiIn:
     def open_port_by_name_async(self, name):
         """Legacy method - toggles port instead"""
         self.toggle_port_by_name(name)
+
+    def watch_port(self, name):
+        """Watch a port and reconnect if it disappears and reappears"""
+        def watcher():
+            was_connected = True
+            while True:
+                try:
+                    time.sleep(2.0)
+                    available = self.list_ports()
+                    if was_connected and name not in available:
+                        was_connected = False
+                        if name in self.active_ports:
+                            try: self.active_ports[name].close_port()
+                            except: pass
+                            del self.active_ports[name]
+                            print(f"[MIDI] Disconnected: {name}")
+                    elif not was_connected and name in available:
+                        print(f"[MIDI] Reappeared, reconnecting: {name}")
+                        self.connect_port(name)
+                        was_connected = True
+                except Exception: pass
+        threading.Thread(target=watcher, daemon=True).start()
 
 def midi_callback(message_data, timestamp):
     global midi_transport_state, last_active_channel, last_activity_time, last_midi_activity
@@ -1423,6 +1539,7 @@ def handle_up():
     _last_button_time["up"] = now
     global selectedindex, volume_level, rename_char_idx, channel_volumes, mixer_selected_ch, bpm, metro_vol, metro_adjusting, drum_kit_index, selected_drum_kit, loop_length
     global rename_scroll_count, last_rename_scroll_time, rename_cursor_pos
+    global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_interp_idx, synth_adjusting
     if operation_mode == "VOLUME":
         volume_level = min(1.0, volume_level + 0.05)
         if fs: fs.setting('synth.gain', volume_level)
@@ -1473,6 +1590,15 @@ def handle_up():
                 metro_vol = min(127, metro_vol + 5)
                 if fs: fs.cc(9, 7, metro_vol)
         else: selectedindex = max(0, selectedindex - 1)
+    elif operation_mode == "SYNTH":
+        if synth_adjusting:
+            si = selectedindex
+            if si == 0: synth_polyphony_idx = (synth_polyphony_idx - 1) % len(SYNTH_POLYPHONY_OPTS)
+            elif si == 1: synth_reverb_idx  = (synth_reverb_idx  - 1) % len(SYNTH_REVERB_OPTS)
+            elif si == 2: synth_chorus_idx  = (synth_chorus_idx  - 1) % len(SYNTH_CHORUS_OPTS)
+            elif si == 3: synth_buffer_idx  = (synth_buffer_idx  - 1) % len(SYNTH_BUFFER_OPTS)
+            elif si == 4: synth_interp_idx  = (synth_interp_idx  - 1) % len(SYNTH_INTERP_OPTS)
+        else: selectedindex = max(0, selectedindex - 1)
     else: selectedindex = max(0, selectedindex - 1)
 
 def handle_down():
@@ -1482,6 +1608,7 @@ def handle_down():
     _last_button_time["down"] = now
     global selectedindex, volume_level, rename_char_idx, channel_volumes, mixer_selected_ch, bpm, metro_vol, metro_adjusting, drum_kit_index, selected_drum_kit, loop_length
     global rename_scroll_count, last_rename_scroll_time, rename_cursor_pos
+    global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_interp_idx, synth_adjusting
     if operation_mode == "VOLUME":
         volume_level = max(0.0, volume_level - 0.05)
         if fs: fs.setting('synth.gain', volume_level)
@@ -1532,6 +1659,15 @@ def handle_down():
                 metro_vol = max(0, metro_vol - 5)
                 if fs: fs.cc(9, 7, metro_vol)
         else: selectedindex = min(2, selectedindex + 1)
+    elif operation_mode == "SYNTH":
+        if synth_adjusting:
+            si = selectedindex
+            if si == 0: synth_polyphony_idx = (synth_polyphony_idx + 1) % len(SYNTH_POLYPHONY_OPTS)
+            elif si == 1: synth_reverb_idx  = (synth_reverb_idx  + 1) % len(SYNTH_REVERB_OPTS)
+            elif si == 2: synth_chorus_idx  = (synth_chorus_idx  + 1) % len(SYNTH_CHORUS_OPTS)
+            elif si == 3: synth_buffer_idx  = (synth_buffer_idx  + 1) % len(SYNTH_BUFFER_OPTS)
+            elif si == 4: synth_interp_idx  = (synth_interp_idx  + 1) % len(SYNTH_INTERP_OPTS)
+        else: selectedindex = min(len(SYNTH_PARAMS) - 1, selectedindex + 1)
     else: selectedindex = min(len(files) - 1, selectedindex + 1)
 
 def handle_back():
@@ -1542,6 +1678,7 @@ def handle_back():
     global operation_mode, files, pathes, selectedindex, rename_string, mixer_adjusting, metro_adjusting
     global MESSAGE, msg_start_time, recorder, loop_midi_events, loop_undo_stack
     global loop_recording, loop_playback, metronome_on
+    global synth_adjusting
     global back_press_count, back_press_last_time
     
     current_time = time.time()
@@ -1677,6 +1814,10 @@ def handle_back():
         if mixer_adjusting: mixer_adjusting = False; return
         else: save_mixer() 
     if operation_mode == "METRONOME" and metro_adjusting: metro_adjusting = False; return
+    if operation_mode == "SYNTH" and synth_adjusting:
+        synth_adjusting = False
+        apply_synth_settings()
+        return
     if operation_mode == "RENAME":
         global rename_cursor_pos
         if rename_cursor_pos > 0:
@@ -1698,6 +1839,7 @@ def handle_select():
     global loop_bar_count, loop_midi_events, loop_start_time, countdown_value
     global countdown_start, drum_kit_index, loop_length, bpm
     global file_loop_duration, file_loop_start_time # <--- CRITICAL
+    global synth_selected, synth_adjusting
     global operation_mode, files, pathes, selectedindex, MESSAGE, msg_start_time, fs, sfid, SHUTTING_DOWN
     global rename_string, rename_char_idx, rename_cursor_pos, mixer_adjusting, metronome_on, selected_file_path, loaded_sf2_path, metro_adjusting
     global playback_mode  # NEW - needed for playback system
@@ -1717,6 +1859,13 @@ def handle_select():
     if operation_mode == "METRONOME":
         if selectedindex == 0: metronome_on = not metronome_on
         else: metro_adjusting = not metro_adjusting
+        return
+
+    if operation_mode == "SYNTH":
+        # Toggle adjusting for the selected parameter, apply immediately
+        synth_adjusting = not synth_adjusting
+        if not synth_adjusting:
+            apply_synth_settings()
         return
         
     if not files and operation_mode != "RENAME": return
@@ -1758,6 +1907,9 @@ def handle_select():
             return
         if sel == "UNDO OVERDUB":
             undo_last_overdub()
+            return
+        if sel == "DOUBLE LOOP":
+            double_loop()
             return
         if sel == "RECORD":
             
@@ -1869,6 +2021,11 @@ def handle_select():
             return
         
         if sel == "VOLUME": operation_mode = "VOLUME"; return
+        if sel == "SYNTH":
+            synth_selected = 0; synth_adjusting = False
+            operation_mode = "SYNTH"
+            files[:] = SYNTH_PARAMS; selectedindex = 0
+            return
         if sel == "POWER": toggle_power_mode(); return
         
         if sel == "SHUTDOWN":
@@ -2282,6 +2439,29 @@ def update_display():
             if i == selectedindex: draw.rectangle([10, y-5, 230, y+25], outline=(0, 255, 0) if metro_adjusting else color)
             draw.text((20, y), opt, font=font, fill=color)
 
+    elif operation_mode == "SYNTH":
+        current_vals = [
+            str(SYNTH_POLYPHONY_OPTS[synth_polyphony_idx]),
+            SYNTH_REVERB_OPTS[synth_reverb_idx],
+            SYNTH_CHORUS_OPTS[synth_chorus_idx],
+            str(SYNTH_BUFFER_OPTS[synth_buffer_idx]),
+            SYNTH_INTERP_OPTS[synth_interp_idx],
+        ]
+        view_size = 5
+        start_idx = max(0, min(selectedindex - 2, len(SYNTH_PARAMS) - view_size))
+        for i in range(start_idx, min(start_idx + view_size, len(SYNTH_PARAMS))):
+            y = 45 + (i - start_idx) * 36
+            is_sel = (i == selectedindex)
+            color = (0, 0, 0) if is_sel else accent
+            if is_sel:
+                bg = (0, 180, 0) if synth_adjusting else (60, 60, 180)
+                draw.rectangle([10, y - 2, 230, y + 28], fill=bg)
+            draw.text((15, y), SYNTH_PARAMS[i], font=font_tiny, fill=color)
+            draw.text((145, y), current_vals[i], font=font_tiny,
+                      fill=(255, 255, 0) if (is_sel and synth_adjusting) else color)
+        hint = "UP/DN: Change  BACK: Done" if synth_adjusting else "SELECT: Edit  BACK: Menu"
+        draw.text((10, 220), hint, font=font_tiny, fill=(120, 120, 120))
+
     elif operation_mode == "LOOP LENGTH":
         draw.text((20, 80), "LOOP LENGTH:", font=font, fill=accent)
         draw.rectangle((15, 115, 225, 160), fill=(50, 50, 50))
@@ -2328,37 +2508,29 @@ def update_display():
     else:
         view_size = 5; start_idx = max(0, min(selectedindex - 2, len(files) - view_size))
         for i, line in enumerate(files[start_idx:start_idx+view_size], start=start_idx):
-            y = 62 + (i-start_idx)*28; color = (0,0,0) if i == selectedindex else accent
+            y = 62 + (i-start_idx)*28
+            if line == "DOUBLE LOOP" and (not loop_midi_events or loop_length >= 32):
+                color = (80, 80, 80) if i != selectedindex else (0, 0, 0)
+            else:
+                color = (0, 0, 0) if i == selectedindex else accent
             if i == selectedindex: draw.rectangle([10, y, 230, y+26], fill=accent)
             draw.text((15, y+2), line[:22], font=font, fill=color)
     
-    # Loop recording progress display - larger and clearer
+    # Loop recording progress - compact status bar at bottom
     if loop_recording or loop_playback:
         current_bpm = MONKEY_BPM if BLE_CONNECTED else bpm
-        beats_per_bar = 4
-        seconds_per_beat = 60.0 / current_bpm
-        seconds_per_bar = seconds_per_beat * beats_per_bar
-        
-        # Calculate progress
         bar_text = f"Bar {loop_bar_count + 1}/{loop_length}"
-        status_text = "● RECORDING" if loop_recording else "▶ LOOP PLAY"
-        
-        # Semi-transparent dark overlay for better visibility
-        draw.rectangle((10, 75, 230, 155), fill=(20, 20, 20))
-        draw.rectangle((10, 75, 230, 155), outline=(0, 255, 0), width=2)
-        
-        # Status text - large and prominent
-        draw.text((30, 85), status_text, font=font, fill=(255, 255, 0) if loop_recording else (0, 255, 0))
-        
-        # Progress bar - bigger
-        draw.rectangle((20, 115, 220, 140), outline=(0, 255, 0), width=2)
+        status_text = "● REC" if loop_recording else "▶ LOOP"
+        color = (255, 80, 80) if loop_recording else (0, 255, 0)
+        draw.rectangle((0, 205, 240, 240), fill=(20, 20, 20))
+        draw.line((0, 205, 240, 205), fill=color, width=1)
         progress = (loop_bar_count / loop_length) if loop_length > 0 else 0
-        fill_width = int(196 * progress)
+        fill_width = int(240 * progress)
         if fill_width > 0:
-            draw.rectangle((22, 117, 22 + fill_width, 138), fill=(0, 255, 0))
-        
-        # Bar count centered in progress bar
-        draw.text((90, 122), bar_text, font=font_tiny, fill=(255, 255, 255))
+            draw.rectangle((0, 206, fill_width, 240),
+                           fill=(50, 20, 20) if loop_recording else (20, 50, 20))
+        draw.text((8, 214), status_text, font=font_tiny, fill=color)
+        draw.text((100, 214), bar_text, font=font_tiny, fill=(200, 200, 200))
     
     # File playback indicators - compact to not obscure menu buttons
     elif playback_mode == PLAYBACK_FILE and file_play_path:
