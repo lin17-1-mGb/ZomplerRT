@@ -182,19 +182,21 @@ loop_length = 4  # Number of bars in loop (4, 8, 16, 32)
 loop_recording = False  # True when recording a loop
 
 # ---------------------- SYNTH SETTINGS ----------------------
-SYNTH_PARAMS = ["POLYPHONY", "REVERB", "CHORUS", "BUFFER", "INTERPOLATION"]
+SYNTH_PARAMS = ["POLYPHONY", "REVERB", "CHORUS", "BUFFER", "BRIGHTNESS"]
 synth_selected  = 0
 synth_adjusting = False
 synth_polyphony_idx = 1   # 64
 synth_reverb_idx    = 0   # Off
 synth_chorus_idx    = 0   # Off
 synth_buffer_idx    = 1   # 128
-synth_interp_idx    = 1   # Sinc
-SYNTH_POLYPHONY_OPTS = [32, 64, 96, 128, 256]
-SYNTH_REVERB_OPTS    = ["Off", "Small", "Medium", "Large"]
-SYNTH_CHORUS_OPTS    = ["Off", "Light", "Heavy"]
-SYNTH_BUFFER_OPTS    = [64, 128, 256]
-SYNTH_INTERP_OPTS    = ["Linear", "Sinc"]
+synth_brightness_idx = 4  # 100%
+SYNTH_POLYPHONY_OPTS  = [32, 64, 96, 128, 256]
+SYNTH_REVERB_OPTS     = ["Off", "Small", "Medium", "Large"]
+SYNTH_CHORUS_OPTS     = ["Off", "Light", "Heavy"]
+SYNTH_BUFFER_OPTS     = [64, 128, 256]
+SYNTH_BRIGHTNESS_OPTS = [0.05, 0.15, 0.30, 0.60, 1.0]  # 5/15/30/60/100%
+SYNTH_BRIGHTNESS_LBLS = ["5%", "15%", "30%", "60%", "100%"]
+backlight_pwm = None  # PWMLED instance, set in init_display
 loop_playback = False  # True when loop is playing back
 loop_file_path = None  # Path to temporary loop file
 loop_start_time = 0  # When loop recording started
@@ -899,6 +901,27 @@ def loop_monitor_thread():
                             # Only save undo state and merge if new notes were actually recorded
                             has_notes = any(e['type'] == 'note_on' for e in new_events)
                             if has_notes:
+                                # Fix orphaned note_ons: if a note_on has no matching note_off
+                                # (held across loop boundary), add a note_off at loop end
+                                total_loop_secs = (60.0 / current_bpm) * 4 * loop_length
+                                active = {}
+                                for e in sorted(new_events, key=lambda x: x['time']):
+                                    key = (e['channel'], e['note']) if 'note' in e else None
+                                    if key and e['type'] == 'note_on':
+                                        active[key] = e
+                                    elif key and e['type'] == 'note_off':
+                                        active.pop(key, None)
+                                for (ch, note), on_event in active.items():
+                                    new_events.append({
+                                        'time': total_loop_secs - 0.01,
+                                        'type': 'note_off',
+                                        'channel': ch,
+                                        'note': note
+                                    })
+                                    if fs:
+                                        try: fs.noteoff(ch, note)
+                                        except: pass
+
                                 loop_undo_stack.append(copy.deepcopy(loop_midi_events))
                                 if len(loop_undo_stack) > MAX_UNDO_LEVELS:
                                     loop_undo_stack.pop(0)
@@ -995,7 +1018,7 @@ class UPS_C:
         v = self.get_voltage()
         if v == 0.0: return "N/A"
         p = self.get_capacity_percent()
-        total_minutes = (p / 100) * (190 if LOW_POWER_MODE else 160)
+        total_minutes = (p / 100) * (210 if LOW_POWER_MODE else 180)
         return f"{int(total_minutes // 60)}h{int(total_minutes % 60):02d}m"
 
 ups = UPS_C()
@@ -1052,7 +1075,7 @@ def lazy_imports():
 
 def init_buttons():
     global button_up, button_down, button_select, button_back
-    from gpiozero import Button
+    from gpiozero import Button, PWMLED
     # Adding pull_up=True is essential for Pirate Audio buttons
     button_up = Button(16, pull_up=True)
     button_down = Button(24, pull_up=True)
@@ -1065,7 +1088,11 @@ def init_display():
         return  # Already initialised by early splash
     try:
         import st7789 as st_lib
-        disp = st_lib.ST7789(width=240, height=240, rotation=90, port=0, cs=st_lib.BG_SPI_CS_FRONT, dc=9, backlight=13, spi_speed_hz=24_000_000)
+        from gpiozero import Button, PWMLED
+        global backlight_pwm
+        backlight_pwm = PWMLED(13)
+        backlight_pwm.value = SYNTH_BRIGHTNESS_OPTS[synth_brightness_idx]
+        disp = st_lib.ST7789(width=240, height=240, rotation=90, port=0, cs=st_lib.BG_SPI_CS_FRONT, dc=9, backlight=None, spi_speed_hz=24_000_000)
         disp.begin()
         img = Image.new("RGB", (240, 240), (0, 0, 0))
         draw = ImageDraw.Draw(img)
@@ -1137,6 +1164,13 @@ def undo_last_overdub():
 
     was_playing = loop_playback
 
+    # Silence any currently sounding notes before restoring
+    if fs:
+        try:
+            for ch in range(16):
+                fs.cc(ch, 123, 0)  # All notes off
+        except: pass
+
     # Pause playback engine so it stops iterating old events
     with playback_lock:
         playback_mode = PLAYBACK_NONE
@@ -1154,6 +1188,12 @@ def undo_last_overdub():
     MESSAGE = f"Undone! ({len(loop_undo_stack)} left)"
     msg_start_time = time.time()
     print(f"[UNDO] Restored previous state ({len(loop_undo_stack)} undo levels remaining)")
+
+def set_brightness(idx):
+    global synth_brightness_idx
+    synth_brightness_idx = idx
+    if backlight_pwm:
+        backlight_pwm.value = SYNTH_BRIGHTNESS_OPTS[idx]
 
 def apply_synth_settings():
     """Apply current synth_* index values to FluidSynth"""
@@ -1186,14 +1226,9 @@ def apply_synth_settings():
             depth = [8.0, 8.0, 12.0][ch]
             fs.set_chorus(nr, level, speed, depth, 0)
 
-        # Interpolation — 1=linear, 4=sinc 7th order
-        interp = 1 if synth_interp_idx == 0 else 4
-        fs.setting('synth.interpolation', interp)
-
         print(f"[SYNTH] Applied: poly={SYNTH_POLYPHONY_OPTS[synth_polyphony_idx]} "
               f"reverb={SYNTH_REVERB_OPTS[synth_reverb_idx]} "
-              f"chorus={SYNTH_CHORUS_OPTS[synth_chorus_idx]} "
-              f"interp={SYNTH_INTERP_OPTS[synth_interp_idx]}")
+              f"chorus={SYNTH_CHORUS_OPTS[synth_chorus_idx]}")
     except Exception as e:
         print(f"[SYNTH] apply error: {e}")
 
@@ -1543,7 +1578,8 @@ def handle_up():
     _last_button_time["up"] = now
     global selectedindex, volume_level, rename_char_idx, channel_volumes, mixer_selected_ch, bpm, metro_vol, metro_adjusting, drum_kit_index, selected_drum_kit, loop_length
     global rename_scroll_count, last_rename_scroll_time, rename_cursor_pos
-    global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_interp_idx, synth_adjusting
+    global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_adjusting
+    global synth_brightness_idx
     if operation_mode == "VOLUME":
         volume_level = min(1.0, volume_level + 0.05)
         if fs: fs.setting('synth.gain', volume_level)
@@ -1600,8 +1636,8 @@ def handle_up():
             if si == 0: synth_polyphony_idx = (synth_polyphony_idx - 1) % len(SYNTH_POLYPHONY_OPTS)
             elif si == 1: synth_reverb_idx  = (synth_reverb_idx  - 1) % len(SYNTH_REVERB_OPTS)
             elif si == 2: synth_chorus_idx  = (synth_chorus_idx  - 1) % len(SYNTH_CHORUS_OPTS)
-            elif si == 3: synth_buffer_idx  = (synth_buffer_idx  - 1) % len(SYNTH_BUFFER_OPTS)
-            elif si == 4: synth_interp_idx  = (synth_interp_idx  - 1) % len(SYNTH_INTERP_OPTS)
+            elif si == 3: synth_buffer_idx    = (synth_buffer_idx    - 1) % len(SYNTH_BUFFER_OPTS)
+            elif si == 4: set_brightness((synth_brightness_idx - 1) % len(SYNTH_BRIGHTNESS_OPTS))
         else: selectedindex = max(0, selectedindex - 1)
     else: selectedindex = max(0, selectedindex - 1)
 
@@ -1612,7 +1648,8 @@ def handle_down():
     _last_button_time["down"] = now
     global selectedindex, volume_level, rename_char_idx, channel_volumes, mixer_selected_ch, bpm, metro_vol, metro_adjusting, drum_kit_index, selected_drum_kit, loop_length
     global rename_scroll_count, last_rename_scroll_time, rename_cursor_pos
-    global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_interp_idx, synth_adjusting
+    global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_adjusting
+    global synth_brightness_idx
     if operation_mode == "VOLUME":
         volume_level = max(0.0, volume_level - 0.05)
         if fs: fs.setting('synth.gain', volume_level)
@@ -1669,8 +1706,8 @@ def handle_down():
             if si == 0: synth_polyphony_idx = (synth_polyphony_idx + 1) % len(SYNTH_POLYPHONY_OPTS)
             elif si == 1: synth_reverb_idx  = (synth_reverb_idx  + 1) % len(SYNTH_REVERB_OPTS)
             elif si == 2: synth_chorus_idx  = (synth_chorus_idx  + 1) % len(SYNTH_CHORUS_OPTS)
-            elif si == 3: synth_buffer_idx  = (synth_buffer_idx  + 1) % len(SYNTH_BUFFER_OPTS)
-            elif si == 4: synth_interp_idx  = (synth_interp_idx  + 1) % len(SYNTH_INTERP_OPTS)
+            elif si == 3: synth_buffer_idx    = (synth_buffer_idx    + 1) % len(SYNTH_BUFFER_OPTS)
+            elif si == 4: set_brightness((synth_brightness_idx + 1) % len(SYNTH_BRIGHTNESS_OPTS))
         else: selectedindex = min(len(SYNTH_PARAMS) - 1, selectedindex + 1)
     else: selectedindex = min(len(files) - 1, selectedindex + 1)
 
@@ -1713,9 +1750,9 @@ def handle_back():
             # Restore previous loop state from undo stack
             if loop_undo_stack:
                 import copy
-                loop_midi_events = copy.deepcopy(loop_undo_stack[-1])
-                MESSAGE = "Undone! Rec restarted"
-                print(f"[UNDO] Restored to previous state, {len(loop_undo_stack)} undo levels available")
+                loop_midi_events = loop_undo_stack.pop()
+                MESSAGE = f"Undone! ({len(loop_undo_stack)} left)"
+                print(f"[UNDO] Restored to previous state, {len(loop_undo_stack)} undo levels remaining")
             else:
                 MESSAGE = "Overdub cancelled - restarting"
                 print("[UNDO] No undo history, just cancelling current overdub")
@@ -2449,7 +2486,7 @@ def update_display():
             SYNTH_REVERB_OPTS[synth_reverb_idx],
             SYNTH_CHORUS_OPTS[synth_chorus_idx],
             str(SYNTH_BUFFER_OPTS[synth_buffer_idx]),
-            SYNTH_INTERP_OPTS[synth_interp_idx],
+            SYNTH_BRIGHTNESS_LBLS[synth_brightness_idx],
         ]
         view_size = 5
         start_idx = max(0, min(selectedindex - 2, len(SYNTH_PARAMS) - view_size))
