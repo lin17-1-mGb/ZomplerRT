@@ -1142,6 +1142,7 @@ def init_fluidsynth_lazy():
             # ==============================
             # START
             # ==============================
+            fs.setting('midi.driver', 'none')  # rtmidi handles MIDI, not FluidSynth
             fs.start(driver="alsa", device="hw:0,0")
             apply_synth_settings()
 
@@ -1361,6 +1362,13 @@ class MultiMidiIn:
     def __init__(self):
         import rtmidi as rt_lib
         self.rt_lib = rt_lib
+        # Use raw ALSA backend to avoid snd_seq warnings
+        try:
+            self._api = rt_lib.API_LINUX_ALSA
+        except AttributeError:
+            self._api = 0
+        # Persistent scanner instance — avoids creating new MidiIn every list_ports() call
+        self._scanner = rt_lib.MidiIn(self._api)
         self.active_ports = {}  # {port_name: MidiIn object}
         self.callback = None
     
@@ -1395,12 +1403,11 @@ class MultiMidiIn:
             global MESSAGE, msg_start_time
             try:
                 # Get all available ports
-                temp_midi = self.rt_lib.MidiIn()
-                ports = temp_midi.get_ports()
+                ports = self.list_ports()
                 
                 if name in ports:
                     # Create new MidiIn for this port
-                    midiin = self.rt_lib.MidiIn()
+                    midiin = self.rt_lib.MidiIn(self._api)
                     midiin.open_port(ports.index(name))
                     
                     # Set callback
@@ -1433,8 +1440,7 @@ class MultiMidiIn:
     
     def list_ports(self):
         """List all available MIDI ports"""
-        temp_midi = self.rt_lib.MidiIn()
-        return temp_midi.get_ports()
+        return self._scanner.get_ports()
     
     def get_connected_ports(self):
         """Get list of currently connected port names"""
