@@ -13,6 +13,8 @@ Hardware and software setup for the Zompler RT on a Raspberry Pi Zero 2W with Pi
 - USB-A to Micro-USB OTG adapter (for MIDI keyboard)
 - Works well with bluetooth midi controllers such as Wavy Industries Monkey, CME WIDI
 ---
+## compressed .img file 
+https://nextcloud.englishup.me/s/s3996AY23pAerSn
 
 ## 1. Flash Raspberry Pi OS
 
