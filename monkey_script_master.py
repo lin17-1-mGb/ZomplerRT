@@ -1018,7 +1018,7 @@ class UPS_C:
         v = self.get_voltage()
         if v == 0.0: return "N/A"
         p = self.get_capacity_percent()
-        total_minutes = (p / 100) * (210 if LOW_POWER_MODE else 180)
+        total_minutes = (p / 100) * (190 if LOW_POWER_MODE else 160)
         return f"{int(total_minutes // 60)}h{int(total_minutes % 60):02d}m"
 
 ups = UPS_C()
@@ -1142,7 +1142,7 @@ def init_fluidsynth_lazy():
             # ==============================
             # START
             # ==============================
-            fs.setting('midi.driver', 'none')  # rtmidi handles MIDI, not FluidSynth
+            #fs.setting('midi.driver', 'none')  # rtmidi handles MIDI, not FluidSynth
             fs.start(driver="alsa", device="hw:0,0")
             apply_synth_settings()
 
@@ -1268,6 +1268,9 @@ def toggle_power_mode():
         # Lower polyphony only if SYNTH menu hasn't set it higher than 64
         if fs and SYNTH_POLYPHONY_OPTS[synth_polyphony_idx] > 48:
             fs.setting('synth.polyphony', 48)
+        # Auto-dim to 30% if currently brighter
+        if synth_brightness_idx > 2:  # index 2 = 30%
+            set_brightness(2)
         MESSAGE = "Low Power: ON"
     else:
         # Restore WiFi
@@ -1278,6 +1281,8 @@ def toggle_power_mode():
         # Restore polyphony from SYNTH menu setting
         if fs:
             fs.setting('synth.polyphony', SYNTH_POLYPHONY_OPTS[synth_polyphony_idx])
+        # Restore brightness to 100%
+        set_brightness(4)
         MESSAGE = "Low Power: OFF"
     msg_start_time = time.time()
 
@@ -1727,6 +1732,7 @@ def handle_back():
     global loop_recording, loop_playback, metronome_on
     global synth_adjusting
     global back_press_count, back_press_last_time
+    global loop_start_time, loop_bar_count, playback_mode, loop_midi_events, loop_undo_stack
     
     current_time = time.time()
     
@@ -1764,7 +1770,15 @@ def handle_back():
                 print("[UNDO] No undo history, just cancelling current overdub")
             
             msg_start_time = current_time
-            
+
+            # Reset loop to bar 1 immediately
+            loop_start_time = time.time()
+            loop_bar_count = 0
+            with playback_lock:
+                if loop_midi_events:
+                    playback_mode = PLAYBACK_NONE
+                    playback_mode = PLAYBACK_LIVE_LOOP
+
             # Restart overdub recording immediately
             recorder.start()
             return
