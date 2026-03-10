@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Monkey MIDI Player - MASTER VERSION (Full Features + BLE BPM)
+VERSION = "64bit RT"
 import sys
 sys.path.insert(0, '/usr/local/lib/python3.11/dist-packages/st7789')
 import os, time, threading, smbus, datetime, json, asyncio
@@ -1422,7 +1423,7 @@ class MultiMidiIn:
                     # Store in active ports
                     self.active_ports[name] = midiin
                     self.watch_port(name)
-                    MESSAGE = f"Conn: {name[:16]}"
+                    MESSAGE = f"+ {name[:16]}"
                     msg_start_time = time.time()
             except Exception as e:
                 MESSAGE = f"Error: {str(e)[:15]}"
@@ -1438,7 +1439,7 @@ class MultiMidiIn:
                 self.active_ports[name].close_port()
                 del self.active_ports[name]
                 
-                MESSAGE = f"Disconn: {name[:13]}"
+                MESSAGE = f"- {name[:16]}"
                 msg_start_time = time.time()
             except:
                 pass
@@ -2416,6 +2417,7 @@ def update_display():
     
     draw.rectangle((0, 26, 240, 56), fill=(50, 50, 50))
     draw.text((10, 31), operation_mode.upper(), font=font, fill=accent)
+    draw.text((175, 31), VERSION, font=font_tiny, fill=(0, 200, 255))
     if operation_mode == "RENAME":
         # Show filename with cursor
         before_cursor = rename_string[:rename_cursor_pos]
