@@ -2328,7 +2328,6 @@ def handle_back():
         if arrange_mode == "arrange":
             if arrange_running:
                 arrange_stop()
-                arrange_mode = "slots"
                 MESSAGE = "Arrange stopped"; msg_start_time = time.time()
                 return
             if arrange_editing:
