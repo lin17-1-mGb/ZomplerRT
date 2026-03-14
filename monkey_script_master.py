@@ -15,6 +15,7 @@ BASE_DIR = "/home/pi"
 soundfont_folder = os.path.join(BASE_DIR, "sf2")
 midi_file_folder = os.path.join(BASE_DIR, "midifiles")
 mixer_file = os.path.join(BASE_DIR, "mixer_settings.json")
+arrange_state_file = os.path.join(BASE_DIR, "arrange_state.json")
 
 # --- 3. CONFIGURATION & STATE ---
 LED_NAME = "ACT"  
@@ -28,6 +29,7 @@ volume_level = 0.5
 MONKEY_BPM = 120
 BLE_CONNECTED = False
 MONKEY_ADDRESS = "EF:B5:72:34:E5:03"
+BLE_LATENCY_MS = 45  # BLE MIDI latency compensation in ms — tune if needed
 DATA_UUID = "1a9f2b32-1c1a-4ef0-9fb2-6a5e26c03db9"
 file_loop_enabled = False
 file_loop_path = None
@@ -75,6 +77,8 @@ class BleakMonitor:
 
     async def run(self):
         global BLE_CONNECTED
+        # Wait for BT stack to fully settle after boot before first attempt
+        await asyncio.sleep(5)
         while not SHUTTING_DOWN:
             try:
                 async with BleakClient(MONKEY_ADDRESS, timeout=10.0) as client:
@@ -82,11 +86,14 @@ class BleakMonitor:
                     await client.write_gatt_char(DATA_UUID, bytes([0xc8, 0x00, 0x00, 0x00]))
                     await client.start_notify(DATA_UUID, self.notification_handler)
                     BLE_CONNECTED = True
+                    print("[BLE] Connected to Monkey")
                     while client.is_connected and not SHUTTING_DOWN:
                         await asyncio.sleep(1)
                 BLE_CONNECTED = False
-            except:
+                print("[BLE] Disconnected, retrying in 5s...")
+            except Exception as e:
                 BLE_CONNECTED = False
+                print(f"[BLE] Connection failed: {e}, retrying in 5s...")
                 if not SHUTTING_DOWN: await asyncio.sleep(5)
 
 def start_ble_thread():
@@ -183,7 +190,7 @@ loop_length = 4  # Number of bars in loop (4, 8, 16, 32)
 loop_recording = False  # True when recording a loop
 
 # ---------------------- SYNTH SETTINGS ----------------------
-SYNTH_PARAMS = ["POLYPHONY", "REVERB", "CHORUS", "BUFFER", "BRIGHTNESS"]
+SYNTH_PARAMS = ["POLYPHONY", "REVERB", "CHORUS", "BUFFER", "BRIGHTNESS", "QUANTISE"]
 synth_selected  = 0
 synth_adjusting = False
 synth_polyphony_idx = 1   # 64
@@ -191,12 +198,14 @@ synth_reverb_idx    = 0   # Off
 synth_chorus_idx    = 0   # Off
 synth_buffer_idx    = 1   # 128
 synth_brightness_idx = 4  # 100%
+synth_quantise_idx  = 0   # Off
 SYNTH_POLYPHONY_OPTS  = [32, 64, 96, 128, 256]
 SYNTH_REVERB_OPTS     = ["Off", "Small", "Medium", "Large"]
 SYNTH_CHORUS_OPTS     = ["Off", "Light", "Heavy"]
 SYNTH_BUFFER_OPTS     = [64, 128, 256]
 SYNTH_BRIGHTNESS_OPTS = [0.05, 0.15, 0.30, 0.60, 1.0]  # 5/15/30/60/100%
 SYNTH_BRIGHTNESS_LBLS = ["5%", "15%", "30%", "60%", "100%"]
+SYNTH_QUANTISE_OPTS   = ["Off", "1/4", "1/8", "1/16", "1/32"]
 backlight_pwm = None  # PWMLED instance, set in init_display
 loop_playback = False  # True when loop is playing back
 loop_file_path = None  # Path to temporary loop file
@@ -205,6 +214,25 @@ loop_bar_count = 0  # Current bar being recorded/played
 loop_midi_events = []  # Stored MIDI events for playback
 loop_playback_thread_active = False  # Thread control
 
+# ---------------------- LOOP SLOTS ----------------------
+SLOT_NAMES = ["A", "B", "C", "D"]
+slot_events   = [None, None, None, None]  # midi events per slot (None = empty)
+slot_bars     = [4,    4,    4,    4   ]  # bar count per slot
+slot_active   = -1   # which slot is currently playing (-1 = none)
+slot_selected = 0    # cursor in LOOP SLOTS menu
+slot_recording = -1  # which slot is currently being recorded into (-1 = none)
+
+# ---------------------- ARRANGE ----------------------
+# sequence is a list of [slot_idx, repeat_count] e.g. [[0,2],[1,4],[0,1]]
+arrange_sequence  = []       # the arrangement
+arrange_pos       = 0        # current step index in sequence
+arrange_rep_count = 0        # how many times current step has played
+arrange_running   = False    # True when auto-playing arrangement
+arrange_loop      = True     # True = loop arrangement, False = stop at end
+arrange_cursor    = 0        # cursor in ARRANGE editor (step index)
+arrange_editing   = False    # True when editing a step's repeat count
+arrange_mode      = "slots"  # "slots" = normal slot view, "arrange" = arrange editor
+arrange_skip_next = False    # signal from manual-next button to advance immediately
 # ---------------------- UNDO STACK ----------------------
 loop_undo_stack = []  # Stack of previous loop states for undo
 MAX_UNDO_LEVELS = 5  # Keep last 5 overdubs
@@ -363,6 +391,275 @@ def hard_stop_all_playback():
                     pass
             active_notes[ch].clear()
 
+def slot_stop():
+    """Stop whichever slot is currently playing."""
+    global slot_active, loop_playback
+    hard_stop_all_playback()
+    loop_playback = False
+    slot_active = -1
+
+def slot_play(idx):
+    """Start playing slot idx. Stops current slot first."""
+    global slot_active, loop_midi_events, loop_length, loop_start_time, loop_bar_count
+    global loop_playback, playback_mode
+    if slot_events[idx] is None:
+        return  # Empty slot
+    slot_stop()
+    # Load slot into the main loop engine
+    loop_midi_events = list(slot_events[idx])
+    loop_length = slot_bars[idx]
+    loop_bar_count = 0
+    loop_start_time = time.time()
+    loop_playback = True
+    slot_active = idx
+    start_playback_thread_once()
+    with playback_lock:
+        playback_mode = PLAYBACK_LIVE_LOOP
+    print(f"[SLOTS] Playing slot {SLOT_NAMES[idx]} ({loop_length} bars)")
+
+def slot_start_record(idx):
+    """Start recording into slot idx. Stops any playing slot."""
+    global slot_recording, loop_recording, loop_midi_events, loop_bar_count, loop_start_time
+    global loop_undo_stack
+    slot_stop()
+    slot_recording = idx
+    loop_midi_events = []
+    loop_undo_stack.clear()
+    loop_bar_count = 0
+    loop_start_time = time.time()
+    loop_recording = True
+    recorder.start()
+    print(f"[SLOTS] Recording into slot {SLOT_NAMES[idx]}")
+
+def slot_finish_record():
+    """Called when loop recording completes — save into slot."""
+    global slot_recording, slot_active, loop_recording, loop_playback
+    if slot_recording < 0:
+        return
+    idx = slot_recording
+    slot_events[idx] = list(loop_midi_events)
+    slot_bars[idx] = loop_length
+    slot_recording = -1
+    loop_recording = False
+    loop_playback = False
+    print(f"[SLOTS] Saved slot {SLOT_NAMES[idx]} ({loop_length} bars, {len(slot_events[idx])} events)")
+    save_arrangement_state()  # Persist immediately so reboot restores it
+    # Auto-play the slot we just recorded
+    slot_play(idx)
+
+def slots_clear():
+    """Clear all slots — called when leaving LOOP SLOTS menu."""
+    global slot_events, slot_bars, slot_active, slot_recording, slot_selected
+    global loop_playback
+    slot_stop()
+    loop_playback = False
+    slot_events   = [None, None, None, None]
+    slot_bars     = [4, 4, 4, 4]
+    slot_active   = -1
+    slot_recording = -1
+    slot_selected  = 0
+    print("[SLOTS] All slots cleared")
+
+def save_arrangement_midi():
+    """Save the full arrangement as a single MIDI file by concatenating slot events."""
+    if not arrange_sequence:
+        return None, "No steps to save"
+    try:
+        import mido, datetime
+        current_bpm = MONKEY_BPM if BLE_CONNECTED else bpm
+        seconds_per_beat = 60.0 / current_bpm
+        seconds_per_bar  = seconds_per_beat * 4
+        ticks_per_beat   = 480
+        tempo            = int(500000 * (120.0 / current_bpm))  # microseconds per beat
+
+        mid   = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+        track = mido.MidiTrack()
+        mid.tracks.append(track)
+
+        # Set tempo
+        track.append(mido.MetaMessage('set_tempo', tempo=tempo, time=0))
+
+        # Build flat list of (abs_tick, msg) pairs
+        abs_msgs = []
+        cursor_secs = 0.0
+
+        for sidx, reps in arrange_sequence:
+            events = slot_events[sidx]
+            if events is None:
+                continue
+            bars       = slot_bars[sidx]
+            loop_secs  = seconds_per_bar * bars
+
+            for rep in range(reps):
+                offset = cursor_secs + rep * loop_secs
+                for e in events:
+                    abs_secs = offset + e['time']
+                    abs_tick = int(mido.second2tick(abs_secs, ticks_per_beat, tempo))
+                    t = e['type']
+                    ch = e.get('channel', 0)
+                    if t == 'note_on':
+                        abs_msgs.append((abs_tick, mido.Message('note_on',  channel=ch, note=e['note'], velocity=e['velocity'])))
+                    elif t == 'note_off':
+                        abs_msgs.append((abs_tick, mido.Message('note_off', channel=ch, note=e['note'], velocity=0)))
+                    elif t == 'control_change':
+                        abs_msgs.append((abs_tick, mido.Message('control_change', channel=ch, control=e['control'], value=e['value'])))
+                    elif t == 'program_change':
+                        abs_msgs.append((abs_tick, mido.Message('program_change', channel=ch, program=e['program'])))
+
+            cursor_secs += loop_secs * reps
+
+        # Sort and convert to delta ticks
+        abs_msgs.sort(key=lambda x: x[0])
+        prev_tick = 0
+        for abs_tick, msg in abs_msgs:
+            delta = abs_tick - prev_tick
+            track.append(msg.copy(time=delta))
+            prev_tick = abs_tick
+
+        # End of track
+        track.append(mido.MetaMessage('end_of_track', time=0))
+
+        ts   = datetime.datetime.now().strftime("%H%M%S")
+        path = os.path.join(midi_file_folder, f"arrange_{ts}.mid")
+        mid.save(path)
+        total_bars = sum(slot_bars[s] * r for s, r in arrange_sequence)
+        print(f"[ARRANGE] Saved {path} ({total_bars} bars, {len(abs_msgs)} events)")
+        return path, f"Saved! {total_bars} bars"
+    except Exception as e:
+        print(f"[ARRANGE] Save error: {e}")
+        return None, f"Save failed: {e}"
+
+def save_arrangement_state():
+    """Save slot events + arrangement sequence to JSON for reload after reboot."""
+    try:
+        state = {
+            "arrange_sequence": arrange_sequence,
+            "arrange_loop":     arrange_loop,
+            "slot_bars":        slot_bars,
+            "slots": []
+        }
+        for i in range(4):
+            if slot_events[i] is not None:
+                state["slots"].append({"index": i, "events": slot_events[i]})
+            else:
+                state["slots"].append({"index": i, "events": None})
+        with open(arrange_state_file, 'w') as f:
+            json.dump(state, f)
+        print(f"[ARRANGE] State saved to {arrange_state_file}")
+        return True, "State saved!"
+    except Exception as e:
+        print(f"[ARRANGE] State save error: {e}")
+        return False, f"Save failed: {e}"
+
+def load_arrangement_state():
+    """Load slot events + arrangement from saved JSON."""
+    global slot_events, slot_bars, arrange_sequence, arrange_loop
+    if not os.path.exists(arrange_state_file):
+        return False, "No saved state"
+    try:
+        with open(arrange_state_file, 'r') as f:
+            state = json.load(f)
+        arrange_sequence[:] = state.get("arrange_sequence", [])
+        arrange_loop = state.get("arrange_loop", True)
+        loaded_bars  = state.get("slot_bars", [4, 4, 4, 4])
+        for i in range(4):
+            slot_bars[i] = loaded_bars[i]
+        for s in state.get("slots", []):
+            idx = s["index"]
+            slot_events[idx] = s["events"]  # None or list of event dicts
+        n_slots = sum(1 for e in slot_events if e is not None)
+        n_steps = len(arrange_sequence)
+        print(f"[ARRANGE] State loaded: {n_slots} slots, {n_steps} steps")
+        return True, f"Loaded: {n_slots} slots, {n_steps} steps"
+    except Exception as e:
+        print(f"[ARRANGE] State load error: {e}")
+        return False, f"Load failed: {e}"
+
+def arrange_start():
+    """Start playing the arrangement from the beginning."""
+    global arrange_running, arrange_pos, arrange_rep_count, arrange_skip_next
+    if not arrange_sequence:
+        return
+    # Filter to only steps whose slot has events
+    valid = [(i, s) for i, s in enumerate(arrange_sequence) if slot_events[s[0]] is not None]
+    if not valid:
+        return
+    arrange_pos = 0
+    arrange_rep_count = 0
+    arrange_skip_next = False
+    arrange_running = True
+    # Play first step immediately
+    idx, reps = arrange_sequence[arrange_pos]
+    slot_play(idx)
+    print(f"[ARRANGE] Started: step 0 = slot {SLOT_NAMES[idx]} x{reps}")
+
+def arrange_stop():
+    """Stop the arrangement."""
+    global arrange_running
+    arrange_running = False
+    slot_stop()
+    print("[ARRANGE] Stopped")
+
+def arrange_next_step():
+    """Advance to next step in arrangement (called at loop boundary or manual skip)."""
+    global arrange_pos, arrange_rep_count, arrange_running
+    if not arrange_running or not arrange_sequence:
+        return
+    arrange_rep_count += 1
+    _, reps = arrange_sequence[arrange_pos]
+    if arrange_rep_count >= reps:
+        # Move to next step
+        arrange_pos += 1
+        arrange_rep_count = 0
+        if arrange_pos >= len(arrange_sequence):
+            if arrange_loop:
+                arrange_pos = 0
+                print("[ARRANGE] Looping back to start")
+            else:
+                arrange_running = False
+                slot_stop()
+                print("[ARRANGE] Finished")
+                return
+    idx, _ = arrange_sequence[arrange_pos]
+    if slot_events[idx] is not None:
+        slot_play(idx)
+        print(f"[ARRANGE] Step {arrange_pos} = slot {SLOT_NAMES[idx]} (rep {arrange_rep_count+1}/{arrange_sequence[arrange_pos][1]})")
+    else:
+        # Skip empty slot
+        arrange_next_step()
+
+def arrange_monitor():
+    """Background thread: watches loop boundaries and advances arrangement."""
+    global arrange_skip_next
+    while not SHUTTING_DOWN:
+        try:
+            if arrange_running and arrange_sequence and loop_start_time > 0:
+                current_bpm = MONKEY_BPM if BLE_CONNECTED else bpm
+                seconds_per_bar = (60.0 / current_bpm) * 4
+                total_loop_seconds = seconds_per_bar * slot_bars[arrange_sequence[arrange_pos][0]]
+                elapsed = time.time() - loop_start_time
+                # Check for manual skip or loop boundary
+                if arrange_skip_next or elapsed >= total_loop_seconds - 0.05:
+                    arrange_skip_next = False
+                    arrange_next_step()
+                    time.sleep(0.15)  # Brief pause to avoid double-trigger
+                    continue
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"[ARRANGE] Monitor error: {e}")
+            time.sleep(0.1)
+
+threading.Thread(target=arrange_monitor, daemon=True).start()
+
+# Auto-load saved arrangement state on startup
+def _auto_load_arrange():
+    time.sleep(3)  # Wait for system to settle
+    ok, msg = load_arrangement_state()
+    if ok:
+        print(f"[ARRANGE] Auto-loaded state: {msg}")
+threading.Thread(target=_auto_load_arrange, daemon=True).start()
+
+
 def responsive_sleep(seconds, still_running_fn):
     """High-resolution sleep that exits instantly on STOP."""
     end = time.time() + seconds
@@ -506,6 +803,11 @@ def loop_playback_thread():
                     elapsed = time.time() - loop_start
                     if elapsed < total_loop_seconds:
                         responsive_sleep(total_loop_seconds - elapsed, lambda: playback_mode == PLAYBACK_LIVE_LOOP)
+                    # Silence any ringing notes before loop restarts
+                    if fs:
+                        for ch in range(16):
+                            try: fs.cc(ch, 123, 0)
+                            except: pass
                     _live_loop_anchor = loop_start + total_loop_seconds  # Chain: no drift accumulation
 
             # ==================================================
@@ -817,20 +1119,55 @@ def loop_monitor_thread():
                                         })
                         except Exception as e:
                             print(f"Error loading loop: {e}")
-                        
+
+                        # --- CLAMP TO LOOP BOUNDARY ---
+                        # Drop any events that bled past the loop end
+                        # and send note-offs for any notes that were held across boundary
+                        bleed_notes = set()
+                        clamped = []
+                        for e in loop_midi_events:
+                            if e['time'] >= total_loop_seconds:
+                                # Event is past loop end — if it's a note_on, track for note-off
+                                if e['type'] == 'note_on' and 'note' in e:
+                                    bleed_notes.add((e['channel'], e['note']))
+                                print(f"[CLAMP] Dropped {e['type']} note={e.get('note','-')} at {e['time']*1000:.1f}ms (loop={total_loop_seconds*1000:.0f}ms)")
+                            else:
+                                clamped.append(e)
+                        # Add note-offs at loop end - 10ms for any held notes
+                        for (ch, note) in bleed_notes:
+                            clamped.append({'time': total_loop_seconds - 0.01, 'type': 'note_off', 'channel': ch, 'note': note})
+                            if fs:
+                                try: fs.noteoff(ch, note)
+                                except: pass
+                        loop_midi_events = clamped
+
+                        # Apply quantise to initial loop
+                        if synth_quantise_idx > 0 or BLE_CONNECTED:
+                            note_ons_before = [(e['time'], e.get('note')) for e in loop_midi_events if e['type']=='note_on']
+                            loop_midi_events = quantise_events(loop_midi_events, current_bpm)
+                            note_ons_after = [(e['time'], e.get('note')) for e in loop_midi_events if e['type']=='note_on']
+                            if synth_quantise_idx > 0:
+                                print(f"[QUANTISE] Initial loop {SYNTH_QUANTISE_OPTS[synth_quantise_idx]} @ {current_bpm}BPM")
+                                for (tb, nb), (ta, na) in zip(note_ons_before, note_ons_after):
+                                    print(f"  note {nb}: {tb*1000:.1f}ms -> {ta*1000:.1f}ms (delta {(ta-tb)*1000:.1f}ms)")
+                            loop_midi_events.sort(key=lambda x: x['time'])
+
                         loop_file_path = temp_path
                         loop_playback = True
                         loop_bar_count = 0
                         # Use intended boundary time not time.time() - eliminates file loading delay offset
                         loop_start_time = intended_loop_end
-                        
-                        # Start playback using new system
-                        start_playback_thread_once()
-                        with playback_lock:
-                            playback_mode = PLAYBACK_LIVE_LOOP
-                        
-                        # Start overdub recording
-                        recorder.start()
+
+                        # If recording into a slot, save and auto-play it
+                        if slot_recording >= 0:
+                            slot_finish_record()
+                        else:
+                            # Normal loop — start playback
+                            start_playback_thread_once()
+                            with playback_lock:
+                                playback_mode = PLAYBACK_LIVE_LOOP
+                            # Start overdub recording
+                            recorder.start()
                 
                 time.sleep(0.1)  # Check 10 times per second
             elif loop_playback:
@@ -902,9 +1239,27 @@ def loop_monitor_thread():
                             # Only save undo state and merge if new notes were actually recorded
                             has_notes = any(e['type'] == 'note_on' for e in new_events)
                             if has_notes:
+                                total_loop_secs = (60.0 / current_bpm) * 4 * loop_length
+
+                                # Clamp overdub events to loop boundary
+                                bleed_notes = set()
+                                clamped = []
+                                for e in new_events:
+                                    if e['time'] >= total_loop_secs:
+                                        if e['type'] == 'note_on' and 'note' in e:
+                                            bleed_notes.add((e['channel'], e['note']))
+                                        print(f"[CLAMP] Overdub dropped {e['type']} at {e['time']*1000:.1f}ms")
+                                    else:
+                                        clamped.append(e)
+                                for (ch, note) in bleed_notes:
+                                    clamped.append({'time': total_loop_secs - 0.01, 'type': 'note_off', 'channel': ch, 'note': note})
+                                    if fs:
+                                        try: fs.noteoff(ch, note)
+                                        except: pass
+                                new_events = clamped
+
                                 # Fix orphaned note_ons: if a note_on has no matching note_off
                                 # (held across loop boundary), add a note_off at loop end
-                                total_loop_secs = (60.0 / current_bpm) * 4 * loop_length
                                 active = {}
                                 for e in sorted(new_events, key=lambda x: x['time']):
                                     key = (e['channel'], e['note']) if 'note' in e else None
@@ -927,6 +1282,14 @@ def loop_monitor_thread():
                                 if len(loop_undo_stack) > MAX_UNDO_LEVELS:
                                     loop_undo_stack.pop(0)
                                 print(f"[UNDO] Saved state (stack size: {len(loop_undo_stack)})")
+                                if synth_quantise_idx > 0:
+                                    note_ons_before = [(e['time'], e.get('note')) for e in new_events if e['type']=='note_on']
+                                new_events = quantise_events(new_events, current_bpm)
+                                if synth_quantise_idx > 0:
+                                    note_ons_after = [(e['time'], e.get('note')) for e in new_events if e['type']=='note_on']
+                                    print(f"[QUANTISE] {SYNTH_QUANTISE_OPTS[synth_quantise_idx]} @ {current_bpm}BPM grid={60.0/current_bpm/[1,2,4,8][synth_quantise_idx-1]*1000:.1f}ms")
+                                    for (tb, nb), (ta, na) in zip(note_ons_before, note_ons_after):
+                                        print(f"  note {nb}: {tb*1000:.1f}ms -> {ta*1000:.1f}ms (delta {(ta-tb)*1000:.1f}ms)")
                                 loop_midi_events.extend(new_events)
                                 loop_midi_events.sort(key=lambda x: x['time'])
                             else:
@@ -1025,7 +1388,7 @@ class UPS_C:
 ups = UPS_C()
 
 # --- 8. UI STATE ---
-MAIN_MENU = ["MIDI KEYBOARD", "SOUND FONT", "MIDI FILE", "MIXER", "DRUM KIT", "RECORD", "STOP LOOP", "UNDO OVERDUB", "DOUBLE LOOP", "LOOP LENGTH", "METRONOME", "VOLUME", "SYNTH", "POWER", "SHUTDOWN"]
+MAIN_MENU = ["MIDI KEYBOARD", "SOUND FONT", "MIDI FILE", "MIXER", "DRUM KIT", "RECORD", "STOP LOOP", "UNDO OVERDUB", "DOUBLE LOOP", "LOOP LENGTH", "LOOP SLOTS", "METRONOME", "VOLUME", "SYNTH", "POWER", "SHUTDOWN"]
 files = MAIN_MENU.copy()
 pathes = MAIN_MENU.copy()
 selectedindex = 0
@@ -1056,6 +1419,10 @@ BACK_PRESS_TIMEOUT = 2.0  # Reset counter if more than 2 seconds between presses
 last_active_time = 0  # Timestamp of last activity
 DEBOUNCE_MS = 0.15  # 150ms debounce window for all buttons
 _last_button_time = {"up": 0, "down": 0, "select": 0, "back": 0}
+_scroll_press_count = {"up": 0, "down": 0}  # For fast scroll acceleration
+_scroll_last_time   = {"up": 0, "down": 0}  # Time of last press for acceleration
+SCROLL_ACCEL_THRESHOLD = 0.4  # seconds — presses faster than this accelerate scroll
+SCROLL_ACCEL_SKIP = 3         # skip this many items when scrolling fast
 selected_drum_kit = 0  # Currently selected drum kit program (0-127)
 available_drum_kits = []  # List of (program_number, name) tuples for available drums
 drum_kit_index = 0  # Index in available_drum_kits list
@@ -1190,6 +1557,40 @@ def undo_last_overdub():
     MESSAGE = f"Undone! ({len(loop_undo_stack)} left)"
     msg_start_time = time.time()
     print(f"[UNDO] Restored previous state ({len(loop_undo_stack)} undo levels remaining)")
+
+def quantise_events(events, bpm):
+    """Quantise note_on event times to nearest grid, shift paired note_offs by same delta.
+    Also compensates for BLE latency offset."""
+    seconds_per_beat = 60.0 / max(bpm, 1)
+    # Grid sizes: 1/4, 1/8, 1/16, 1/32
+    divisions = [1, 2, 4, 8][max(synth_quantise_idx - 1, 0)]
+    grid = seconds_per_beat / divisions
+
+    # BLE latency compensation — shift all events back by offset
+    ble_offset = BLE_LATENCY_MS / 1000.0 if BLE_CONNECTED else 0.0
+
+    if synth_quantise_idx == 0 and ble_offset == 0.0:
+        return events  # Nothing to do
+
+    deltas = {}  # (channel, note) -> delta applied to note_on
+    quantised = []
+    for e in events:
+        e = dict(e)
+        # Apply BLE offset first
+        e['time'] = max(0.0, e['time'] - ble_offset)
+
+        if synth_quantise_idx > 0:
+            if e['type'] == 'note_on' and 'note' in e:
+                snapped = round(e['time'] / grid) * grid
+                delta = snapped - e['time']
+                deltas[(e['channel'], e['note'])] = delta
+                e['time'] = snapped
+            elif e['type'] == 'note_off' and 'note' in e:
+                key = (e['channel'], e['note'])
+                if key in deltas:
+                    e['time'] = max(0.0, e['time'] + deltas.pop(key))
+        quantised.append(e)
+    return quantised
 
 def set_brightness(idx):
     global synth_brightness_idx
@@ -1591,7 +1992,16 @@ def handle_up():
     global selectedindex, volume_level, rename_char_idx, channel_volumes, mixer_selected_ch, bpm, metro_vol, metro_adjusting, drum_kit_index, selected_drum_kit, loop_length
     global rename_scroll_count, last_rename_scroll_time, rename_cursor_pos
     global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_adjusting
-    global synth_brightness_idx
+    global synth_brightness_idx, synth_quantise_idx
+    global _scroll_press_count, _scroll_last_time
+    if operation_mode == "LOOP SLOTS" and arrange_mode == "arrange":
+        global arrange_cursor, arrange_editing
+        if arrange_editing and arrange_cursor < len(arrange_sequence):
+            s = arrange_sequence[arrange_cursor]
+            s[1] = min(16, s[1] + 1)  # Increase repeat count
+        else:
+            arrange_cursor = max(0, arrange_cursor - 1)
+        return
     if operation_mode == "VOLUME":
         volume_level = min(1.0, volume_level + 0.05)
         if fs: fs.setting('synth.gain', volume_level)
@@ -1650,8 +2060,17 @@ def handle_up():
             elif si == 2: synth_chorus_idx  = (synth_chorus_idx  - 1) % len(SYNTH_CHORUS_OPTS)
             elif si == 3: synth_buffer_idx    = (synth_buffer_idx    - 1) % len(SYNTH_BUFFER_OPTS)
             elif si == 4: set_brightness((synth_brightness_idx - 1) % len(SYNTH_BRIGHTNESS_OPTS))
+            elif si == 5: synth_quantise_idx = (synth_quantise_idx - 1) % len(SYNTH_QUANTISE_OPTS)
         else: selectedindex = max(0, selectedindex - 1)
-    else: selectedindex = max(0, selectedindex - 1)
+    else:
+        # Fast scroll acceleration for main menu
+        if now - _scroll_last_time["up"] < SCROLL_ACCEL_THRESHOLD:
+            _scroll_press_count["up"] = min(_scroll_press_count["up"] + 1, 10)
+        else:
+            _scroll_press_count["up"] = 1
+        _scroll_last_time["up"] = now
+        step = SCROLL_ACCEL_SKIP if _scroll_press_count["up"] >= 4 else 1
+        selectedindex = max(0, selectedindex - step)
 
 def handle_down():
     if SHUTTING_DOWN: return
@@ -1661,7 +2080,16 @@ def handle_down():
     global selectedindex, volume_level, rename_char_idx, channel_volumes, mixer_selected_ch, bpm, metro_vol, metro_adjusting, drum_kit_index, selected_drum_kit, loop_length
     global rename_scroll_count, last_rename_scroll_time, rename_cursor_pos
     global synth_polyphony_idx, synth_reverb_idx, synth_chorus_idx, synth_buffer_idx, synth_adjusting
-    global synth_brightness_idx
+    global synth_brightness_idx, synth_quantise_idx
+    global _scroll_press_count, _scroll_last_time
+    if operation_mode == "LOOP SLOTS" and arrange_mode == "arrange":
+        global arrange_cursor, arrange_editing
+        if arrange_editing and arrange_cursor < len(arrange_sequence):
+            s = arrange_sequence[arrange_cursor]
+            s[1] = max(1, s[1] - 1)  # Decrease repeat count
+        else:
+            arrange_cursor = min(len(arrange_sequence) + 3, arrange_cursor + 1)  # +3 = add,play,savemidi,savestate
+        return
     if operation_mode == "VOLUME":
         volume_level = max(0.0, volume_level - 0.05)
         if fs: fs.setting('synth.gain', volume_level)
@@ -1720,8 +2148,17 @@ def handle_down():
             elif si == 2: synth_chorus_idx  = (synth_chorus_idx  + 1) % len(SYNTH_CHORUS_OPTS)
             elif si == 3: synth_buffer_idx    = (synth_buffer_idx    + 1) % len(SYNTH_BUFFER_OPTS)
             elif si == 4: set_brightness((synth_brightness_idx + 1) % len(SYNTH_BRIGHTNESS_OPTS))
+            elif si == 5: synth_quantise_idx = (synth_quantise_idx + 1) % len(SYNTH_QUANTISE_OPTS)
         else: selectedindex = min(len(SYNTH_PARAMS) - 1, selectedindex + 1)
-    else: selectedindex = min(len(files) - 1, selectedindex + 1)
+    else:
+        # Fast scroll acceleration for main menu
+        if now - _scroll_last_time["down"] < SCROLL_ACCEL_THRESHOLD:
+            _scroll_press_count["down"] = min(_scroll_press_count["down"] + 1, 10)
+        else:
+            _scroll_press_count["down"] = 1
+        _scroll_last_time["down"] = now
+        step = SCROLL_ACCEL_SKIP if _scroll_press_count["down"] >= 4 else 1
+        selectedindex = min(len(files) - 1, selectedindex + step)
 
 def handle_back():
     if SHUTTING_DOWN: return
@@ -1732,6 +2169,7 @@ def handle_back():
     global MESSAGE, msg_start_time, recorder, loop_midi_events, loop_undo_stack
     global loop_recording, loop_playback, metronome_on
     global synth_adjusting
+    global slot_recording, slot_active, slot_selected
     global back_press_count, back_press_last_time
     global loop_start_time, loop_bar_count, playback_mode, loop_midi_events, loop_undo_stack
     
@@ -1772,12 +2210,21 @@ def handle_back():
             
             msg_start_time = current_time
 
-            # Reset loop to bar 1 immediately
+            # Stop playback thread and let it clear active notes
+            with playback_lock:
+                playback_mode = PLAYBACK_NONE
+            time.sleep(0.08)  # Give thread time to process stop and send note-offs
+
+            # Belt-and-braces: silence anything still sounding
+            if fs:
+                for ch in range(16):
+                    fs.cc(ch, 123, 0)  # All notes off
+
+            # Reset loop to bar 1 and restart from clean anchor
             loop_start_time = time.time()
             loop_bar_count = 0
             with playback_lock:
                 if loop_midi_events:
-                    playback_mode = PLAYBACK_NONE
                     playback_mode = PLAYBACK_LIVE_LOOP
 
             # Restart overdub recording immediately
@@ -1876,6 +2323,58 @@ def handle_back():
         if mixer_adjusting: mixer_adjusting = False; return
         else: save_mixer() 
     if operation_mode == "METRONOME" and metro_adjusting: metro_adjusting = False; return
+    if operation_mode == "LOOP SLOTS":
+        global slot_recording, arrange_mode, arrange_editing, arrange_cursor, arrange_running
+        if arrange_mode == "arrange":
+            if arrange_running:
+                arrange_stop()
+                arrange_mode = "slots"
+                MESSAGE = "Arrange stopped"; msg_start_time = time.time()
+                return
+            if arrange_editing:
+                # BACK while editing = exit edit mode (keep the step)
+                arrange_editing = False
+                MESSAGE = "Step saved"; msg_start_time = time.time()
+                return
+            if arrange_cursor < len(arrange_sequence):
+                # BACK on a step (not editing) = delete it
+                del arrange_sequence[arrange_cursor]
+                arrange_cursor = max(0, min(arrange_cursor, len(arrange_sequence) - 1))
+                MESSAGE = "Step deleted" if arrange_sequence else "All steps cleared"; msg_start_time = time.time()
+                return
+            # Exit arrange view back to slot view
+            arrange_mode = "slots"
+            return
+        # Cancel any in-progress slot recording (but keep filled slots)
+        if slot_recording >= 0:
+            try:
+                temp_path = os.path.join(midi_file_folder, "_slot_discard.mid")
+                recorder.stop(temp_path)
+                if os.path.exists(temp_path): os.remove(temp_path)
+            except: pass
+            slot_recording = -1
+            loop_recording = False
+            MESSAGE = "Recording cancelled"; msg_start_time = time.time()
+            return
+        # BACK on a filled idle slot = clear it (with confirm)
+        idx = selectedindex
+        if idx < 4 and slot_events[idx] is not None and slot_active != idx:
+            # Use MESSAGE as confirm prompt — second BACK within 2s clears
+            if MESSAGE == f"BACK again to clear slot {SLOT_NAMES[idx]}":
+                slot_events[idx] = None
+                slot_bars[idx] = 4
+                # Remove any arrange steps that used this slot
+                arrange_sequence[:] = [s for s in arrange_sequence if s[0] != idx]
+                save_arrangement_state()  # Persist the clear immediately
+                MESSAGE = f"Slot {SLOT_NAMES[idx]} cleared"; msg_start_time = time.time()
+                print(f"[SLOTS] Slot {SLOT_NAMES[idx]} cleared")
+            else:
+                MESSAGE = f"BACK again to clear slot {SLOT_NAMES[idx]}"; msg_start_time = time.time()
+            return
+        # Otherwise exit to main menu
+        operation_mode = "main screen"; files[:] = MAIN_MENU.copy()
+        selectedindex = MAIN_MENU.index("LOOP SLOTS")
+        return
     if operation_mode == "SYNTH" and synth_adjusting:
         synth_adjusting = False
         apply_synth_settings()
@@ -1901,7 +2400,8 @@ def handle_select():
     global loop_bar_count, loop_midi_events, loop_start_time, countdown_value
     global countdown_start, drum_kit_index, loop_length, bpm
     global file_loop_duration, file_loop_start_time # <--- CRITICAL
-    global synth_selected, synth_adjusting
+    global synth_selected, synth_adjusting, synth_quantise_idx
+    global slot_selected, slot_active, slot_recording
     global operation_mode, files, pathes, selectedindex, MESSAGE, msg_start_time, fs, sfid, SHUTTING_DOWN
     global rename_string, rename_char_idx, rename_cursor_pos, mixer_adjusting, metronome_on, selected_file_path, loaded_sf2_path, metro_adjusting
     global playback_mode  # NEW - needed for playback system
@@ -1921,6 +2421,82 @@ def handle_select():
     if operation_mode == "METRONOME":
         if selectedindex == 0: metronome_on = not metronome_on
         else: metro_adjusting = not metro_adjusting
+        return
+    if operation_mode == "LOOP SLOTS":
+        global slot_selected, slot_recording, slot_active
+        global arrange_mode, arrange_sequence, arrange_cursor, arrange_editing
+        global arrange_running, arrange_loop, arrange_skip_next, arrange_pos, arrange_rep_count
+
+        if arrange_mode == "arrange":
+            if arrange_running:
+                arrange_skip_next = True
+                MESSAGE = "Next step..."; msg_start_time = time.time()
+                return
+            filled = [i for i in range(4) if slot_events[i] is not None]
+            if not filled:
+                MESSAGE = "Record a slot first"; msg_start_time = time.time()
+                return
+            if arrange_editing:
+                # SEL while editing = cycle slot
+                s = arrange_sequence[arrange_cursor]
+                cur_pos = filled.index(s[0]) if s[0] in filled else 0
+                s[0] = filled[(cur_pos + 1) % len(filled)]
+                MESSAGE = f"Slot {SLOT_NAMES[s[0]]} x{s[1]}  BACK=done"; msg_start_time = time.time()
+                return
+            n = len(arrange_sequence)
+            if arrange_cursor < n:
+                # SEL on existing step — enter edit mode
+                arrange_editing = True
+                MESSAGE = "SEL:slot  UP/DN:reps  BACK:done"; msg_start_time = time.time()
+            elif arrange_cursor == n:
+                # "+ Add" row
+                arrange_sequence.append([filled[0], 1])
+                arrange_cursor = len(arrange_sequence) - 1
+                arrange_editing = True
+                MESSAGE = "SEL:slot  UP/DN:reps  BACK:done"; msg_start_time = time.time()
+            elif arrange_cursor == n + 1:
+                # PLAY row
+                if arrange_sequence:
+                    arrange_start()
+                    MESSAGE = "Arrange playing!"; msg_start_time = time.time()
+            elif arrange_cursor == n + 2:
+                # SAVE MIDI row
+                _, msg = save_arrangement_midi()
+                MESSAGE = msg; msg_start_time = time.time()
+            elif arrange_cursor == n + 3:
+                # SAVE STATE row
+                _, msg = save_arrangement_state()
+                MESSAGE = msg; msg_start_time = time.time()
+        else:
+            # SLOT VIEW — item 4 (index 4) is ARRANGE button
+            idx = selectedindex
+            if idx >= 4 or (idx < len(files) and files[idx] == "ARRANGE"):
+                # ARRANGE button pressed
+                arrange_mode = "arrange"
+                arrange_cursor = 0
+                arrange_editing = False
+                return
+            slot_selected = idx
+            if slot_recording >= 0:
+                MESSAGE = "Already recording a slot"; msg_start_time = time.time()
+                return
+            if slot_events[idx] is None:
+                slot_start_record(idx)
+                MESSAGE = f"Recording slot {SLOT_NAMES[idx]}..."; msg_start_time = time.time()
+            elif slot_active == idx:
+                slot_stop()
+                MESSAGE = f"Slot {SLOT_NAMES[idx]} stopped"; msg_start_time = time.time()
+            elif slot_active >= 0:
+                current_bpm = MONKEY_BPM if BLE_CONNECTED else bpm
+                seconds_per_beat = 60.0 / current_bpm
+                def switch_on_beat():
+                    time.sleep(seconds_per_beat * 0.5)
+                    slot_play(idx)
+                threading.Thread(target=switch_on_beat, daemon=True).start()
+                MESSAGE = f"Slot {SLOT_NAMES[idx]} > beat..."; msg_start_time = time.time()
+            else:
+                slot_play(idx)
+                MESSAGE = f"Playing slot {SLOT_NAMES[idx]}"; msg_start_time = time.time()
         return
 
     if operation_mode == "SYNTH":
@@ -2080,6 +2656,12 @@ def handle_select():
         if sel == "LOOP LENGTH":
             operation_mode = "LOOP LENGTH"
             selectedindex = 0
+            return
+
+        if sel == "LOOP SLOTS":
+            operation_mode = "LOOP SLOTS"
+            files[:] = list(SLOT_NAMES) + ["ARRANGE"]
+            selectedindex = slot_selected
             return
         
         if sel == "VOLUME": operation_mode = "VOLUME"; return
@@ -2417,7 +2999,8 @@ def update_display():
     
     draw.rectangle((0, 26, 240, 56), fill=(50, 50, 50))
     draw.text((10, 31), operation_mode.upper(), font=font, fill=accent)
-    draw.text((175, 31), VERSION, font=font_tiny, fill=(0, 200, 255))
+    if not (operation_mode == "LOOP SLOTS" and arrange_mode == "arrange"):
+        draw.text((175, 31), VERSION, font=font_tiny, fill=(0, 200, 255))
     if operation_mode == "RENAME":
         # Show filename with cursor
         before_cursor = rename_string[:rename_cursor_pos]
@@ -2509,6 +3092,7 @@ def update_display():
             SYNTH_CHORUS_OPTS[synth_chorus_idx],
             str(SYNTH_BUFFER_OPTS[synth_buffer_idx]),
             SYNTH_BRIGHTNESS_LBLS[synth_brightness_idx],
+            SYNTH_QUANTISE_OPTS[synth_quantise_idx],
         ]
         view_size = 5
         start_idx = max(0, min(selectedindex - 2, len(SYNTH_PARAMS) - view_size))
@@ -2531,6 +3115,97 @@ def update_display():
         draw.text((70, 125), f"{loop_length} BARS", font=font, fill=(0, 255, 0))
         draw.text((30, 180), "UP/DN: Change length", font=font_tiny, fill=(180, 180, 180))
         draw.text((30, 200), "BACK: Return to menu", font=font_tiny, fill=(180, 180, 180))
+
+    elif operation_mode == "LOOP SLOTS":
+        if arrange_mode == "arrange":
+            # ---- ARRANGE EDITOR ----
+            # Loop/Stop toggle in top bar
+            loop_lbl = "↺LOOP" if arrange_loop else "■STOP"
+            loop_col = (0, 220, 100) if arrange_loop else (220, 100, 100)
+            draw.text((170, 31), loop_lbl, font=font_tiny, fill=loop_col)
+
+            # Steps list (max 4 visible)
+            max_vis = 3
+            n = len(arrange_sequence)
+            scroll_start = max(0, min(arrange_cursor - 1, n - max_vis)) if n > max_vis else 0
+            for vis_i, seq_i in enumerate(range(scroll_start, min(scroll_start + max_vis, n))):
+                sidx, reps = arrange_sequence[seq_i]
+                y = 58 + vis_i * 38
+                is_cur = (seq_i == arrange_cursor)
+                is_active = (arrange_running and seq_i == arrange_pos)
+                bg = (70, 50, 10) if (is_cur and arrange_editing) else ((50, 50, 50) if is_cur else (25, 25, 25))
+                draw.rectangle([8, y, 232, y+32], fill=bg)
+                draw.text((14, y+8), f"{seq_i+1}.", font=font_tiny, fill=(100, 100, 100))
+                scol = (0, 255, 0) if is_active else ((255, 200, 0) if is_cur else (180, 180, 180))
+                draw.text((32, y+8), f"Slot {SLOT_NAMES[sidx]}", font=font, fill=scol)
+                rcol = (255, 200, 0) if (is_cur and arrange_editing) else (160, 160, 160)
+                draw.text((145, y+8), f"x{reps}", font=font, fill=rcol)
+                if is_active:
+                    draw.text((185, y+8), f"{arrange_rep_count+1}/{reps}", font=font_tiny, fill=(0, 255, 0))
+
+            # "+ Add step" row
+            add_y = 58 + max_vis * 38
+            add_sel = (arrange_cursor == n)
+            draw.rectangle([8, add_y, 232, add_y+22], fill=(40, 40, 40) if add_sel else (20, 20, 20))
+            draw.text((75, add_y+4), "+ Add step", font=font_tiny, fill=(200, 200, 100) if add_sel else (80, 80, 80))
+
+            # Bottom action row: PLAY | SAVE MIDI | SAVE STATE
+            btn_y = add_y + 25
+            # ▶ PLAY  (cursor == n+1)
+            play_sel = (arrange_cursor == n + 1)
+            play_col = (0, 255, 100) if arrange_running else ((255, 255, 0) if play_sel else (90, 90, 90))
+            draw.rectangle([6,  btn_y, 80, btn_y+17], fill=(0,60,0) if arrange_running else ((50,50,10) if play_sel else (20,20,20)))
+            draw.text((10, btn_y+2), "▶ PLAY" if not arrange_running else "▶ ON", font=font_tiny, fill=play_col)
+            # 💾 MIDI  (cursor == n+2)
+            midi_sel = (arrange_cursor == n + 2)
+            midi_col = (100, 200, 255) if midi_sel else (50, 90, 110)
+            draw.rectangle([83, btn_y, 157, btn_y+17], fill=(10,40,60) if midi_sel else (15,15,15))
+            draw.text((87, btn_y+2), "SAVE MIDI", font=font_tiny, fill=midi_col)
+            # 💾 STATE  (cursor == n+3)
+            state_sel = (arrange_cursor == n + 3)
+            state_col = (180, 100, 255) if state_sel else (70, 40, 100)
+            draw.rectangle([160, btn_y, 234, btn_y+17], fill=(40,10,60) if state_sel else (15,15,15))
+            draw.text((164, btn_y+2), "SAVE STATE", font=font_tiny, fill=state_col)
+
+        else:
+            # ---- SLOT VIEW ----
+            for i in range(4):
+                y = 60 + i * 38
+                is_sel = (i == selectedindex)
+                is_playing = (slot_active == i)
+                is_rec = (slot_recording == i)
+                if is_sel:
+                    draw.rectangle([8, y-2, 232, y+34], fill=(60, 60, 60))
+                label_col = (255, 200, 0) if is_sel else (180, 180, 180)
+                draw.text((15, y+8), f"[{SLOT_NAMES[i]}]", font=font, fill=label_col)
+                if is_rec:
+                    status = "● REC"; col = (255, 60, 60)
+                elif is_playing:
+                    status = f"▶ {slot_bars[i]} bars"; col = (0, 255, 0)
+                elif slot_events[i] is not None:
+                    status = f"■ {slot_bars[i]} bars"; col = (100, 180, 255)
+                else:
+                    status = "- empty"; col = (80, 80, 80)
+                draw.text((75, y+8), status, font=font, fill=col)
+            # ARRANGE button at bottom
+            arr_selected = (selectedindex >= 4)
+            if arrange_running:
+                arr_bg = (0, 100, 0)
+                arr_fg = (0, 255, 100)
+                arr_txt = "▶ ARRANGE RUNNING"
+            elif arr_selected:
+                arr_bg = (80, 80, 0)
+                arr_fg = (255, 255, 0)
+                arr_txt = "[ ARRANGE ]"
+            else:
+                arr_bg = (35, 35, 35)
+                arr_fg = (140, 140, 140)
+                arr_txt = "[ ARRANGE ]"
+            draw.rectangle([8, 216, 232, 238], fill=arr_bg)
+            if arr_selected and not arrange_running:
+                draw.rectangle([8, 216, 232, 238], outline=(255, 220, 0), width=2)
+            draw.text((68, 223), arr_txt, font=font_tiny, fill=arr_fg)
+
 
     elif operation_mode == "MIDI KEYBOARD":
         view_size = 5; start_idx = max(0, min(selectedindex - 2, len(files) - view_size))
