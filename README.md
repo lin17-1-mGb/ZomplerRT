@@ -14,7 +14,7 @@ Hardware and software setup for the Zompler RT on a Raspberry Pi Zero 2W with Pi
 - Works well with bluetooth midi controllers such as Wavy Industries Monkey, CME WIDI
 ---
 ## compressed .img file 
-Quickest way to get going - https://nextcloud.englishup.me/s/s3996AY23pAerSn
+Quickest way to get going - 08 March 2026 https://nextcloud.englishup.me/s/s3996AY23pAerSn
 ---
 ## 1. Flash Raspberry Pi OS
 
