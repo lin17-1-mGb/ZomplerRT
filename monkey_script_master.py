@@ -1388,7 +1388,7 @@ class UPS_C:
 ups = UPS_C()
 
 # --- 8. UI STATE ---
-MAIN_MENU = ["MIDI KEYBOARD", "SOUND FONT", "MIDI FILE", "MIXER", "DRUM KIT", "RECORD", "STOP LOOP", "UNDO OVERDUB", "DOUBLE LOOP", "LOOP LENGTH", "LOOP SLOTS", "METRONOME", "VOLUME", "SYNTH", "POWER", "SHUTDOWN"]
+MAIN_MENU = ["MIDI KEYBOARD", "SOUND FONT", "MIDI FILE", "MIXER", "DRUM KIT", "RECORD", "STOP LOOP", "UNDO OVERDUB", "DOUBLE LOOP", "LOOP LENGTH", "LOOP SLOTS", "METRONOME", "VOLUME", "SYNTH", "MUTE ALL", "POWER", "SHUTDOWN"]
 files = MAIN_MENU.copy()
 pathes = MAIN_MENU.copy()
 selectedindex = 0
@@ -1407,6 +1407,10 @@ rename_scroll_count = 0  # Track consecutive scrolls for acceleration
 last_rename_scroll_time = 0  # Track when last scroll happened
 channel_volumes = {i: 100 for i in range(16)}
 load_mixer() # Load settings on start
+
+# MUTE ALL state
+mute_all_active = False
+pre_mute_volumes = {}  # Store volumes before mute
 mixer_selected_ch = 0
 mixer_adjusting = False
 channel_presets = {}
@@ -1449,6 +1453,12 @@ def init_buttons():
     button_down = Button(24, pull_up=True)
     button_select = Button(5, pull_up=True)
     button_back = Button(6, pull_up=True)
+    
+    # Long press settings for fast scroll
+    button_up.hold_time = 0.4  # 400ms to trigger held
+    button_down.hold_time = 0.4
+    button_up.hold_repeat = True  # Repeat while held
+    button_down.hold_repeat = True
 
 def init_display():
     global disp, img, draw, font, font_tiny
@@ -1657,6 +1667,33 @@ def double_loop():
             playback_mode = PLAYBACK_LIVE_LOOP
     MESSAGE = f"Doubled! {loop_length} bars"; msg_start_time = time.time()
     print(f"[LOOP] Doubled to {loop_length} bars")
+
+def toggle_mute_all():
+    """Toggle mute/unmute for all channels"""
+    global mute_all_active, pre_mute_volumes, MESSAGE, msg_start_time
+    
+    if not mute_all_active:
+        # MUTE: Store current volumes and set all to 0
+        pre_mute_volumes = channel_volumes.copy()
+        for ch in range(16):
+            channel_volumes[ch] = 0
+            if fs:
+                fs.cc(ch, 7, 0)  # Volume CC
+                fs.cc(ch, 123, 0)  # All notes off
+        mute_all_active = True
+        MESSAGE = "MUTED"
+        print("[MUTE] All channels muted")
+    else:
+        # UNMUTE: Restore previous volumes
+        for ch in range(16):
+            channel_volumes[ch] = pre_mute_volumes.get(ch, 100)
+            if fs:
+                fs.cc(ch, 7, channel_volumes[ch])
+        mute_all_active = False
+        MESSAGE = "UNMUTED"
+        print("[MUTE] All channels unmuted")
+    
+    msg_start_time = time.time()
 
 def toggle_power_mode():
     global LOW_POWER_MODE, MESSAGE, msg_start_time
@@ -2159,6 +2196,18 @@ def handle_down():
         _scroll_last_time["down"] = now
         step = SCROLL_ACCEL_SKIP if _scroll_press_count["down"] >= 4 else 1
         selectedindex = min(len(files) - 1, selectedindex + step)
+
+def handle_up_held():
+    """Fast scroll up while button held (long press)"""
+    global selectedindex
+    if operation_mode == "main screen":
+        selectedindex = max(0, selectedindex - 3)
+
+def handle_down_held():
+    """Fast scroll down while button held (long press)"""
+    global selectedindex
+    if operation_mode == "main screen":
+        selectedindex = min(len(files) - 1, selectedindex + 3)
 
 def handle_back():
     if SHUTTING_DOWN: return
@@ -2669,6 +2718,7 @@ def handle_select():
             operation_mode = "SYNTH"
             files[:] = SYNTH_PARAMS; selectedindex = 0
             return
+        if sel == "MUTE ALL" or sel == "UNMUTE ALL": toggle_mute_all(); return
         if sel == "POWER": toggle_power_mode(); return
         
         if sel == "SHUTDOWN":
@@ -2910,6 +2960,7 @@ def update_display():
     global _last_display_time, draw, img, MESSAGE, operation_mode, SHUTTING_DOWN
     global loop_recording, loop_playback, countdown_start, loop_start_time, msg_start_time
     global bpm, MONKEY_BPM, BLE_CONNECTED, loop_length, recorder, mixer_selected_ch, mixer_adjusting
+    global mute_all_active
     
     if not init_complete: return  # Hold splash until background_init finishes
     if SHUTTING_DOWN or draw is None: return
@@ -2965,7 +3016,12 @@ def update_display():
                     dynamic_menu[i] = "STOP LOOP"
                 else:
                     dynamic_menu[i] = "PLAY LOOP"
-                break
+            # Update MUTE ALL / UNMUTE ALL based on mute state
+            elif item == "MUTE ALL" or item == "UNMUTE ALL":
+                if mute_all_active:
+                    dynamic_menu[i] = "UNMUTE ALL"
+                else:
+                    dynamic_menu[i] = "MUTE ALL"
         files[:] = dynamic_menu
     
     # Header with LOW BATTERY warning
@@ -2981,7 +3037,11 @@ def update_display():
     # Flash warning if battery low
     flash_on = (int(now * 2) % 2) == 0  # Flash at 2Hz
     
-    if battery_critical and flash_on:
+    # Show MUTE status if active
+    if mute_all_active:
+        draw.rectangle((0, 0, 60, 26), fill=(80, 0, 0))
+        draw.text((10, 4), "MUTED", font=font_tiny, fill=(255, 0, 0))
+    elif battery_critical and flash_on:
         # Critical: Flash red background
         draw.rectangle((0, 0, 120, 26), fill=(80, 0, 0))
         draw.text((10, 4), f"⚠ BATT! {time_left}", font=font_tiny, fill=(255, 0, 0))
@@ -3334,6 +3394,7 @@ def background_init():
         threading.Thread(target=scan_midifiles, daemon=True).start()
         threading.Thread(target=start_ble_thread, daemon=True).start()
         button_up.when_pressed = handle_up; button_down.when_pressed = handle_down
+        button_up.when_held = handle_up_held; button_down.when_held = handle_down_held
         button_select.when_pressed = handle_select; button_back.when_pressed = handle_back
         global midi_manager, init_complete
         midi_manager = MultiMidiIn(); midi_manager.set_callback(midi_callback)
